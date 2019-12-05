@@ -9,6 +9,7 @@ import time
 from io import BytesIO
 from itertools import groupby
 from subprocess import Popen,PIPE, check_output
+import subprocess
 
 import requests
 from KafNafParserPy import *
@@ -18,11 +19,13 @@ from lxml.etree import XMLSyntaxError
 from .alpino_dependency import Calpino_dependency
 from .convert_penn_to_kaf import convert_penn_to_knaf_with_numtokens
 
+
 __version__ = "0.3"
 this_name = 'Morphosyntactic parser based on Alpino'
 last_modified = '2017-03-18'
 
 ###############################################
+
 
 def set_up_alpino():
     ##Uncomment next line and point it to your local path to Alpino if you dont want to set the environment variable ALPINO_HOME
@@ -34,12 +37,32 @@ def set_up_alpino():
     elif 'ALPINO_SERVER' in os.environ:
         return 'server', os.environ['ALPINO_SERVER']
     else:
-        raise Exception('ALPINO_HOME or ALPINO_SERVER variables not set.'
-                        'Set ALPINO_HOME to point to your local path to Alpino. For instance:\n'
-                        'export ALPINO_HOME=/home/your_user/your_tools/Alpino')
+        check_docker = subprocess.call('docker inspect rugcompling/alpino:latest',
+                        shell=True, stdout=subprocess.DEVNULL)
+        if check_docker == 0:
+            tmpdir = tempfile.gettempdir()
+            return 'docker', 'docker run --rm -i -v {}:/work/data '.format(tmpdir) + \
+                    'rugcompling/alpino:latest'
+        else:
+            raise Exception('ALPINO_HOME or ALPINO_SERVER variables not set,'
+                            'and docker image not available.'
+                            'Set ALPINO_HOME to point to your local path to Alpino. For instance:\n'
+                            'export ALPINO_HOME=/home/your_user/your_tools/Alpino'
+                            'Alternatively, pull the docker image rugcompling/alpino:latest')
 
 def tokenize_local(paras, alpino_home):
     cmd = os.path.join(alpino_home, 'Tokenization', 'tok')
+    sentnr = 1
+    for parnr, para in enumerate(paras, start=1):
+        p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
+        out, _err = p.communicate(para.encode("utf-8"))
+        for s in out.decode('utf-8').split("\n"):
+            if s.strip():
+                yield parnr, sentnr, s.strip()
+                sentnr += 1
+
+def tokenize_docker(paras, alpino_home):
+    cmd = alpino_home + ' tok'
     sentnr = 1
     for parnr, para in enumerate(paras, start=1):
         p = Popen(cmd, shell=True, stdin=PIPE, stdout=PIPE)
@@ -74,6 +97,8 @@ def tokenize(naf):
     alpino_type, alpino_location = set_up_alpino()
     if alpino_type == "local":
         sentences = list(tokenize_local(paras, alpino_location))
+    elif alpino_type == 'docker':
+        sentences = list(tokenize_docker(paras, alpino_location))
     else:
         raise NotImplementedError("Tokenization via alpino-server is not implemented yet")
     return list(add_tokenized_to_naf(naf, sentences))
@@ -205,6 +230,8 @@ def call_alpino(sentences, max_min_per_sent):
     alpino_type, alpino_location = set_up_alpino()
     if alpino_type == 'local':
         return call_alpino_local(sentences, max_min_per_sent, alpino_location)
+    elif alpino_type == 'docker':
+        return call_alpino_docker(sentences, max_min_per_sent, alpino_location)
     else:
         return call_alpino_server(sentences, alpino_location)
 
@@ -228,6 +255,71 @@ def sentences_from_naf(sentences):
     for i, sentence in enumerate(sentences, 1):
         sent = " ".join(token.replace('[', '\[').replace(']', '\]') for token, _token_id in sentence)
         yield u"{i}|{sent}".format(**locals())
+
+
+def call_alpino_docker(sentences, max_min_per_sent, alpino_home):
+    ## Under certain condition, there is know bug of Alpino, it sets the encoding in the XML
+    ## to iso-8859-1, but the real encoding is UTF-8. So we need to force to use this encoding
+    parser = etree.XMLParser(encoding='UTF-8')
+
+    # Create temporary folder to store the XML of Alpino
+    out_folder_alp = tempfile.mkdtemp()
+    out_folder_alp_base = os.path.basename(out_folder_alp)
+    out_folder_docker = os.path.join('/work/data', out_folder_alp_base)
+    ####################
+    # Call to Alpinoo and generate the XML files
+    cmd = alpino_home + ' Alpino'
+    if max_min_per_sent is not None:
+        # max_min_per_sent is minutes
+        cmd += ' user_max=%d' % int(max_min_per_sent * 60 * 1000)  # converted to milliseconds
+    cmd += ' end_hook=xml -flag treebank ' \
+                 + out_folder_docker\
+                 +' -parse'
+    logging.info('Calling Alpino with {} sentences'.format(len(sentences)))
+    logging.debug("CMD: {}".format(cmd))
+    t1 = time.time()
+    alpino_pro = Popen(cmd, stdin=PIPE, shell=True)
+    for sentence in sentences_from_naf(sentences):
+        alpino_pro.stdin.write(sentence.encode("utf-8"))
+        alpino_pro.stdin.write(b'\n')
+    alpino_pro.stdin.close()
+    if alpino_pro.wait() != 0:
+        raise Exception("Call to alpino failed (see logs): %s" % cmd)
+    logging.debug("Alpino done in %1.3f seconds" % (time.time() - t1))
+
+    # Parse results, get dependencies, and yield sentence results
+    xml_files = [os.path.join(out_folder_alp, str(i+1)+'.xml') for i in range(len(sentences))]
+    xml_files_docker = [os.path.join(out_folder_docker, str(i+1)+'.xml') for i in range(len(sentences))]
+
+    missing_files = [xml_file for xml_file in xml_files if not os.path.exists(xml_file)]
+    if missing_files:
+        logging.warning('Not found the file {}'.format(missing_files))
+
+    t1 = time.time()
+    logging.info('Calling Alpino for dependencies')
+    alpino_bin = alpino_home + ' Alpino'
+    cmd = [alpino_bin, '-treebank_triples'] + xml_files_docker
+    cmd = ' '.join(cmd)
+    logging.debug("CMD: {}".format(cmd))
+    output = check_output(cmd, shell=True, stderr=subprocess.STDOUT)
+    logging.debug("Alpino -treebank_triples done in %1.3f seconds" % (time.time() - t1))
+
+    def get_filename(output_line):
+        return os.path.basename(output_line.decode("utf-8").split("|")[-1])
+    grouped_lines = {xml_file: list(lines) for xml_file, lines in groupby(output.splitlines(), get_filename)}
+    for i, xml_file in enumerate(xml_files):
+        lines = grouped_lines[os.path.basename(xml_file)]
+        sent = sentences[i]
+        dependencies = [Calpino_dependency(line.strip().decode('utf-8')) for line in lines]
+        tree = etree.parse(xml_file, parser)
+        # Yield sentence, parsed XML tree, and dependencies
+
+        yield sent, tree, dependencies
+
+    # Cleanup
+    shutil.rmtree(out_folder_alp)
+
+
 
 def call_alpino_local(sentences, max_min_per_sent, alpino_home):
     ## Under certain condition, there is know bug of Alpino, it sets the encoding in the XML
